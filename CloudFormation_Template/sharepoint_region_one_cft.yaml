@@ -1,0 +1,226 @@
+#While AWS has documentation on their cloudformation templates, I find that is doesn't give an example for something flexible or dynamic someone might be trying to do.
+#They don't show you ALL the combinations or possibilities in regards to linking services together.
+#Here is a CFT that I hope will give some better insight and example on CFT's
+
+
+Description:
+  Sample template to illustrate use of an existing S3 Bucket as an event source for a Lambda function.
+Parameters:
+  NotificationBucket:
+    Type: String
+    Description: S3 bucket that's used for the Lambda event notification
+
+Resources:
+########################################################################################################
+########## Existing S3 bucket trigger on a new Lambda made in the CFT (WITH PREFIX/SUBFOLDER) ##########
+########################################################################################################
+  S3NotificationBucket:
+    Type: String
+    Properties:
+      Code:
+        S3Bucket: <"Place bucket name here">
+        S3Key: <"Place s3 bucket object key here">
+
+      Handler: <name of your pythonfilename.function_name (shoud be using lambda handler as the function name)
+      FunctionName: <name of the actual Lambda function that you would like to use>
+      Role: <IAM ROLE ARN(this is assuming you dont need to make a new role here in the CFT)>
+      Runtime: python3.8(or whatever runtime you are using)
+      Timeout: 90 (or whatever you want it to be. this is in seconds)
+      #####################################################
+      ### adding VPC Configuration to a Lambda function ###
+      #####################################################
+      VpcConfig:
+        SecurityGroupIds:
+          - sg-12e12121
+        SubnetIds:
+          - subnet-1fe12121
+
+  EventInvokeConfigParser:
+    Type: "AWS::Lambda::EventInvokeConfig"
+    Properties:
+      FunctionName: !Ref S3NotificationLambdaFunction
+      Qualifier: $Latest
+      MaximumEventAgeInSeconds: 90
+      MaximumRetryAttempts: 0
+      #here I will show how you can set-up destination config
+      DestinationConfig:
+        OnFailure:
+          Destination: !Ref ExampleTopic (or if you want to use the cloudwatch alarm created in the CFT to watch your lambda and trigger SNS you can remove 43-45 completely)
+  LambdaInvokePermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !GetAtt S3NotificationLambdaFunction.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: s3.amazonaws.com
+      SourceAccount: !ref "AWS::AccountId"
+      SourceArn: !Sub "arn:aws:s3:::${NotificationBucket}"
+  CustomResourceLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: index.lambda_handler
+      Role: "arn:aws:iam::<account_number>:role/<iamrolename> (can also just copy the arn from the IAM role page)."
+      Code:
+        ZipFile: |
+          from __future__ import print_function
+            import json
+            import boto3
+            import cfnresponse
+
+            SUCCESS = "SUCCESS"
+            FAILED = "FAILED"
+
+            print('Loading function')
+            s3 = boto3.resource('s3')
+
+            def lambda_handler(event, context):
+                print("Received event: " + json.dumps(event, indent=2))
+                responseData={}
+                try:
+                    if event['RequestType'] == 'Delete':
+                        print("Request Type:",event['RequestType'])
+                        Bucket=event['ResourceProperties']['Bucket']
+                        delete_notification(Bucket)
+                        print("Sending response to custom resource after Delete")
+                    elif event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                       print("Request Type:",event['RequestType'])
+                       LambdaArn=event['ResourceProperties']['LambdaArn']
+                       Bucket=event['ResourceProperties']['Bucket']
+                       add_notification(LambdaArn, Bucket)
+                       responseData={'Bucket':Bucket}
+                       print("Sending response to custom resource")
+                  responseStatus = 'SUCCESS'
+              except Exception as e:
+                  print('Failed to process:', e)
+                  responseStatus = 'FAILED'
+                  responseData = {'Failure': 'Something bad happened.' }
+              cfnresponse.send(event, context, responseStatus, responseData)
+
+            def add_notification(LambdaArn, Bucket):
+                bucket_notification = s3.BucketNotification(Bucket)
+                response = bucket_notification.put(
+                    NotificationConfiguration = {
+                      'LambdaFunctionConfigurations':[
+                          {
+                              'LambdaFunctionArn': LambdaArn,
+                              'Events': [
+                                  's3:ObjectCreated:Put
+                              ],
+                              'Filter':{
+                                  'Key': {
+                                    'Filterules':[
+                                      {
+                                      'Name': 'prefix',
+                                      'Value': 's3_subfolder_name/'
+                                      },
+                                    ]
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        )
+            print("Put request completed....")
+            def delete_notification(Bucket):
+                bucket_notification = s3.BucketNotification(Bucket)
+                response = bucket_notification.put(
+                    NotificationConfiguration={}
+                )
+                print("Delete request completed....")
+        Runtime: python3.8
+        Timeout: 50
+        FunctionName: CustomS3Trigger
+        Environment:
+          Variables:
+            databaseName: gitadmin
+            databaseUser: admin
+  LambdaTrigger:
+    Type: "Custom::LambdaTrigger"
+    DependsOn: LambdaInvokePermisson
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+      LambdaArn: !GetAtt S3NotificationLambdaFunction.Arn
+      Bucket: !Ref NotificationBucket
+
+#######################################################################
+##### Creating a cloudwatch alarm for an EXISTING lambda function #####
+#######################################################################
+
+  ExampleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: "Errors"
+      Statistic: Average
+      Period: 300
+      Dimensions:
+      - Name: "FunctionName"
+        Value: "<existing lambda function name here>"
+      AlarmDescription: <lorem ispsom>
+      AlarmName: <name you want>
+      AlarmActions: ["<add existing SNS Arn here>"] (this must be a string)
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      Threshold: 1
+
+#######################################################################
+##################### Creating an SNS Alarm ###########################
+#######################################################################
+
+  ExampleTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      TopicName: "example-name"
+  MyExampleSNSTopic:
+    Type: "AWS::SNS::Subscription"
+    Properties:
+      TopicArn: !Ref ExampleTopic
+      Endpoint: JohnDoe@gmail.com
+      Protocol: email
+      DeliveryPolicy:
+        healthyRetryPolicy:
+          numRetries: 20
+          minDelayTarget: 10
+          maxDelayTarget: 30
+          numMinDelayReries: 3
+          numMaxDelayRetries: 17
+          numDelayRetries: 0
+          backoffFunction: exponential
+
+##############################################################################################
+##################### Creating EventBridge Trigger on Lambda Alarm ###########################
+##############################################################################################
+
+  ScheduledRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Name: example_name
+      Description: ScheduledRule
+      ScheduleExpression: cron(30 5 ? * MON-FRI *)
+      State: ENABLED
+      Targets:
+        - Arn:
+            Fn::GetAtt:
+              - "S3NotificationBucket"
+              - "Arn"
+          Id: TargetFunctionV1
+
+  PermissionForEventsToInvokeLambda:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !Ref S3NotificationBucket
+      Action: "lambda:InvokeFunction"
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledRule.Arn
+
+https://www:
+  oreilly:
+    com/library/view/python-cookbook/0596001673/ch10s12:
+      html:
+
+https://docs:
+  python:
+    org/3/library/email:
+      parser:
+        html:
+
+
